@@ -1,0 +1,19 @@
+# Downloaded third-party binaries (re-downloaded and hash-verified by the scripts)
+lib/
+
+# Sensor logs / generated output
+data/
+
+# Personal settings (recreated with defaults on first run)
+config.json
+
+# Temp files
+*.tmp
+*.log
+
+# OS / editor noise
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+*.swp
