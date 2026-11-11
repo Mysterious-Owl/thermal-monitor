@@ -77,6 +77,14 @@ function Get-ThermalConfig([string]$AppRoot) {
         SensorsCollapsed = $false  # window: sensor list hidden (graph uses full width)
         CollapsedGroups = @()      # window: sensor groups folded in the list (e.g. "CPU")
         ChartSensors    = @('CPU Package', 'CPU Core Max', 'GPU Core', 'SSD Composite')
+        # trend indicator: does the temperature move together with the load?
+        TrendEnabled     = $false
+        TrendDriver      = 'CPU Power'   # CPU Power | CPU Load | GPU Power | GPU Load
+        TrendTemp        = 'CPU Package'
+        TrendSeconds     = 30            # window each change is measured over (10 - 600)
+        TrendTempStepC   = 0.5           # smaller temperature changes count as "steady"
+        TrendPowerStepW  = 1.5           # smaller power changes count as "steady"
+        TrendLoadStepPct = 5             # smaller load changes count as "steady"
     }
     $path = Join-Path $AppRoot 'config.json'
     if (Test-Path -LiteralPath $path) {
@@ -95,6 +103,15 @@ function Get-ThermalConfig([string]$AppRoot) {
     $defaults.SensorsCollapsed = [bool]$defaults.SensorsCollapsed
     $defaults.ChartSensors = @($defaults.ChartSensors | ForEach-Object { [string]$_ })
     $defaults.CollapsedGroups = @($defaults.CollapsedGroups | ForEach-Object { [string]$_ })
+    $defaults.TrendEnabled = [bool]$defaults.TrendEnabled
+    if (@('CPU Power', 'CPU Load', 'GPU Power', 'GPU Load') -notcontains $defaults.TrendDriver) { $defaults.TrendDriver = 'CPU Power' }
+    $defaults.TrendTemp = if ([string]$defaults.TrendTemp) { [string]$defaults.TrendTemp } else { 'CPU Package' }
+    # [double] limits: with whole-number limits [math]::Min would pick its int overload and round 0.5 to 0
+    $clamp = { param($v, [double]$lo, [double]$hi, [double]$def) $d = 0.0; if (-not [double]::TryParse([string]$v, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { $d = $def }; [math]::Min($hi, [math]::Max($lo, $d)) }
+    $defaults.TrendSeconds     = [int](& $clamp $defaults.TrendSeconds 10 600 30)
+    $defaults.TrendTempStepC   = & $clamp $defaults.TrendTempStepC 0.1 10 0.5
+    $defaults.TrendPowerStepW  = & $clamp $defaults.TrendPowerStepW 0.1 50 1.5
+    $defaults.TrendLoadStepPct = & $clamp $defaults.TrendLoadStepPct 1 50 5
     if (-not (Test-Path -LiteralPath $path)) { Save-ThermalConfig $AppRoot $defaults }
     $defaults
 }

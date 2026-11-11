@@ -12,6 +12,12 @@ Built and tested on a Lenovo IdeaPad Slim 5 14IMH9 (Intel Core Ultra 5 125H "Met
   - A hover crosshair with a value box listing every line.
 - **History on start:** when the window opens, the graph is filled from the last *N* minutes of the log.
 - **Moving average:** a toggle with an adjustable window turns every line into a smoothed average.
+- **Trend strip:** a coloured strip under the temperature graph shows whether the temperature is moving with the load:
+  - **Green:** moving together with the load, or still catching up with a recent load change.
+  - **Amber:** rising without extra load, for example the fan slowed or airflow is blocked.
+  - **Blue:** falling on its own, or the load is rising while the temperature holds.
+
+  Hovering shows both changes. The status bar counts the amber stretches.
 - **Settings window:** change the interval, history length, average, warn/hot thresholds, logging and extra hardware. No need to edit JSON by hand.
 - **Console mode:** a single reading, or a refreshing watch view.
 - **iGPU temperature on Meteor Lake:** read directly from the processor's `THERM_STATUS_GT` register through the signed PawnIO driver. Task Manager shows "N/A" on these chips; this uses the same method as LibreHardwareMonitor PR #2551.
@@ -66,6 +72,10 @@ When a new sensor appears, a column is added and older rows get blanks in it. Th
 | `LogToCsv` | true | Write readings to the CSV |
 | `AllHardware` | false | Also probe motherboard, RAM, controllers and PSU |
 | `ChartSensors` | CPU Package, CPU Core Max, GPU Core, SSD Composite | Lines shown on start |
+| `TrendEnabled` | false | Show the trend strip |
+| `TrendTemp` / `TrendDriver` | CPU Package / CPU Power | The pair compared (driver: CPU or GPU Power or Load) |
+| `TrendSeconds` | 30 | Window each change is measured over |
+| `TrendTempStepC` / `TrendPowerStepW` / `TrendLoadStepPct` | 0.5 / 1.5 / 5 | Smaller changes count as steady |
 
 ## Project layout
 

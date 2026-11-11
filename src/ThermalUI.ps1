@@ -277,6 +277,9 @@ $stepAvg = New-Stepper @(10, 15, 30, 60, 120, 300, 600) $config.AverageSeconds '
     param($v) $config.AverageSeconds = $v; Save-ThermalConfig $AppRoot $config; if ($config.AverageEnabled) { Render-AllSeries }; Update-StatusExtras
 }
 $stepAvg.Margin = New-Object System.Windows.Forms.Padding(0, (Px 1), 0, 0)
+$tglTrend = New-CheckToggle 'Trend' $config.TrendEnabled {
+    param($on) $config.TrendEnabled = $on; Save-ThermalConfig $AppRoot $config; Update-Trend; Update-StatusExtras; $chart.Invalidate()
+}
 $tglLog = New-CheckToggle 'Log to CSV' $config.LogToCsv {
     param($on) $config.LogToCsv = $on; Save-ThermalConfig $AppRoot $config
 }
@@ -290,9 +293,12 @@ $bar.Controls.AddRange(@(
     $btnSensors,
     (New-Caption 'Interval'), $stepInterval,
     (New-Caption 'History'),  $stepHistory,
-    $tglAvg, $stepAvg,
+    $tglAvg, $stepAvg, $tglTrend,
     $tglLog, $btnPause, $btnNow, $btnFolder, $btnSettings))
 $tips.SetToolTip($tglAvg, 'Show every line as a moving average over the chosen window')
+$tips.SetToolTip($tglTrend, "Strip under the temperature graph: does the temperature move with the load?`n" +
+    "Green = moving together with load   Amber = rising without extra load`n" +
+    "Blue = falling on its own, or load rising while temperature holds.   Pair and sensitivity: Settings.")
 $tips.SetToolTip($stepAvg, 'Moving-average window')
 
 # status bar
@@ -300,8 +306,76 @@ $strip = New-Object System.Windows.Forms.Panel
 $strip.Dock = 'Bottom'; $strip.Height = Px 24; $strip.BackColor = $Theme.Side
 $strip.Padding = New-Object System.Windows.Forms.Padding((Px 10), 0, (Px 10), 0)
 $strip.Add_Paint({ param($s, $e) $p = New-Object System.Drawing.Pen($Theme.Border); $e.Graphics.DrawLine($p, 0, 0, $strip.Width, 0); $p.Dispose() })
-$status = New-Object System.Windows.Forms.Label
-$status.Dock = 'Fill'; $status.TextAlign = 'MiddleLeft'; $status.Text = 'Starting...'; $status.ForeColor = $Theme.Text
+# Custom-drawn status line: fixed labels ("Last read", "Hottest", ...) are painted once; on each reading
+# only the values that changed are repainted. Each value has a slot that only grows, so nothing shifts.
+$status = New-Object System.Windows.Forms.UserControl
+$status.Dock = 'Fill'; $status.BackColor = $Theme.Side; $status.Font = $UiFont
+[System.Windows.Forms.Control].GetMethod('SetStyle', [Reflection.BindingFlags]'NonPublic,Instance').Invoke($status,
+    @([System.Windows.Forms.ControlStyles]'AllPaintingInWmPaint, UserPaint, OptimizedDoubleBuffer, ResizeRedraw', $true))
+$script:sbMessage = 'Starting...'; $script:sbMessageColor = $Theme.Text
+$script:sbFields = @()          # @{ Key; Label; Value; Color; LX; VX; VW }
+$script:sbSlotW  = @{}          # key -> widest value seen (px)
+
+function Measure-StatusText([string]$t) {
+    if (-not $t) { return 0 }
+    [System.Windows.Forms.TextRenderer]::MeasureText($t, $UiFont, [System.Drawing.Size]::Empty, [System.Windows.Forms.TextFormatFlags]::NoPadding).Width
+}
+
+# A plain message instead of the fields (starting, paused, errors).
+function Set-StatusMessage([string]$text, $color = $Theme.Text) {
+    $script:sbMessage = $text; $script:sbMessageColor = $color
+    $status.Invalidate()
+}
+
+# $fields: ordered list of @{ Key; Label; Value; Color (optional) }
+function Set-StatusFields($fields) {
+    $gapLV = Px 5; $gapF = Px 22
+    $x = 0; $new = @()
+    foreach ($f in $fields) {
+        $lw = Measure-StatusText $f.Label
+        $vw = Measure-StatusText $f.Value
+        if (-not $script:sbSlotW.ContainsKey($f.Key) -or $vw -gt $script:sbSlotW[$f.Key]) { $script:sbSlotW[$f.Key] = $vw }
+        $vx = if ($lw -gt 0) { $x + $lw + $gapLV } else { $x }
+        $slot = $script:sbSlotW[$f.Key]
+        $new += @{ Key = $f.Key; Label = $f.Label; Value = $f.Value; Color = $f.Color; LX = $x; VX = $vx; VW = $slot }
+        $x = $vx + $slot + $gapF
+    }
+    $old = $script:sbFields
+    $sameLayout = -not $script:sbMessage -and $old.Count -eq $new.Count
+    if ($sameLayout) {
+        for ($i = 0; $i -lt $new.Count; $i++) {
+            if ($old[$i].Key -ne $new[$i].Key -or $old[$i].Label -ne $new[$i].Label -or $old[$i].VX -ne $new[$i].VX -or $old[$i].VW -ne $new[$i].VW) { $sameLayout = $false; break }
+        }
+    }
+    $script:sbFields = $new; $script:sbMessage = $null
+    if (-not $sameLayout) { $status.Invalidate(); return }
+    for ($i = 0; $i -lt $new.Count; $i++) {          # repaint only the values that changed
+        if ($old[$i].Value -ne $new[$i].Value -or $old[$i].Color -ne $new[$i].Color) {
+            $status.Invalidate((New-Object System.Drawing.Rectangle(($new[$i].VX - 1), 0, ($new[$i].VW + 2), $status.Height)))
+        }
+    }
+}
+
+$status.Add_Paint({
+    param($s, $e)
+    $g = $e.Graphics; $h = $s.Height
+    if ($script:sbMessage) {
+        Draw-Text $g $script:sbMessage $UiFont $script:sbMessageColor (New-Object System.Drawing.Rectangle(0, 0, $s.Width, $h))
+        return
+    }
+    $flags = [System.Windows.Forms.TextFormatFlags]'VerticalCenter, NoPadding, NoPrefix, SingleLine'
+    foreach ($f in $script:sbFields) {
+        if ($f.Label) {
+            $lr = New-Object System.Drawing.Rectangle($f.LX, 0, ($f.VX - $f.LX), $h)
+            if ($lr.IntersectsWith($e.ClipRectangle)) { [System.Windows.Forms.TextRenderer]::DrawText($g, $f.Label, $UiFont, $lr, $Theme.Muted, $flags) }
+        }
+        $vr = New-Object System.Drawing.Rectangle($f.VX, 0, ($f.VW + 2), $h)
+        if ($vr.IntersectsWith($e.ClipRectangle)) {
+            $c = if ($f.Color) { $f.Color } else { $Theme.Text }
+            [System.Windows.Forms.TextRenderer]::DrawText($g, $f.Value, $UiFont, $vr, $c, $flags)
+        }
+    }
+})
 $statusRight = New-Object System.Windows.Forms.Label
 $statusRight.Dock = 'Right'; $statusRight.AutoSize = $true; $statusRight.ForeColor = $Theme.Muted
 $statusRight.Padding = New-Object System.Windows.Forms.Padding(0, (Px 5), 0, 0)
@@ -747,6 +821,146 @@ function Render-AllSeries {
     foreach ($s in $chart.Series) { Render-Series $s.Name }
     Update-AreaLayout
     Update-AxisRange ([DateTime]::FromOADate($script:nowX))
+    Update-Trend
+}
+
+# ---------------------------------------------------------------- trend indicator
+# For each reading: how much did the temperature (TrendTemp) and the load (TrendDriver) change over the
+# last TrendSeconds? Changes below the "step" settings count as steady. The result is drawn as a coloured
+# strip along the bottom of the temperature graph. Worked out from the raw readings; nothing is logged.
+$TrendStyle = @{
+    Together    = @{ Color = $Theme.Good;                                   Text = 'Moving together with load' }
+    Lag         = @{ Color = $Theme.Good;                                   Text = 'Catching up with a recent load change' }
+    Independent = @{ Color = $Theme.Warn;                                   Text = 'Rising without extra load' }
+    Cooling     = @{ Color = [System.Drawing.ColorTranslator]::FromHtml('#3794FF'); Text = 'Falling on its own (better cooling)' }
+    Holding     = @{ Color = [System.Drawing.ColorTranslator]::FromHtml('#3794FF'); Text = 'Load rising, temperature holding' }
+}
+$script:trX = New-Object System.Collections.Generic.List[double]     # readings that have both sensors
+$script:trT = New-Object System.Collections.Generic.List[double]
+$script:trD = New-Object System.Collections.Generic.List[double]
+$script:trend = New-Object System.Collections.Generic.List[object]   # @{ X; State; dT; dD } per reading
+
+function Get-TrendDriverStep { if ($config.TrendDriver -match 'Load') { $config.TrendLoadStepPct } else { $config.TrendPowerStepW } }
+function Get-TrendDriverUnit { if ($config.TrendDriver -match 'Load') { '%' } else { 'W' } }
+
+# Change over the window ending at reading $i, from a least-squares line (less noisy than last - first).
+# $null when the window has too few readings or crosses a gap in the log.
+function Get-WindowChange($X, $Y, [int]$i, [double]$seconds = $config.TrendSeconds) {
+    $w = $seconds / 86400.0; $gap = Get-GapDays
+    $j = $i
+    while ($j -gt 0 -and $X[$j - 1] -ge $X[$i] - $w -and $X[$j] - $X[$j - 1] -le $gap) { $j-- }
+    $n = $i - $j + 1
+    if ($n -lt 3 -or ($X[$i] - $X[$j]) -lt $w / 2) { return $null }
+    $mx = 0.0; $my = 0.0
+    for ($k = $j; $k -le $i; $k++) { $mx += $X[$k]; $my += $Y[$k] }
+    $mx /= $n; $my /= $n
+    $sxy = 0.0; $sxx = 0.0
+    for ($k = $j; $k -le $i; $k++) { $dx = $X[$k] - $mx; $sxy += $dx * ($Y[$k] - $my); $sxx += $dx * $dx }
+    if ($sxx -le 0) { return $null }
+    $sxy / $sxx * $w
+}
+
+# $dDLong: load change over the last 4 windows. Temperature trails a big load change by a minute or
+# more (heat soak), so a rise soon after the load went up is not "without extra load".
+function Get-TrendState([double]$dT, [double]$dD, $dDLong) {
+    $thT = $config.TrendTempStepC; $thD = Get-TrendDriverStep
+    $tUp = $dT -gt $thT; $tDn = $dT -lt -$thT; $dUp = $dD -gt $thD; $dDn = $dD -lt -$thD
+    if (($tUp -and $dUp) -or ($tDn -and $dDn)) { return 'Together' }
+    if ($null -ne $dDLong) {
+        if ($tUp -and -not $dDn -and $dDLong -gt $thD)  { return 'Lag' }    # still heating up from a recent load rise
+        if ($tDn -and -not $dUp -and $dDLong -lt -$thD) { return 'Lag' }    # still cooling down from a recent load drop
+    }
+    if ($tUp) { return 'Independent' }       # temperature up, load steady or falling
+    if ($tDn) { return 'Cooling' }           # temperature down, load steady or rising
+    if ($dUp) { return 'Holding' }           # load up, temperature steady
+    ''                                       # both steady (or load falling, temperature not yet)
+}
+
+function Add-TrendAt([int]$i) {
+    $dT = Get-WindowChange $script:trX $script:trT $i
+    $dD = Get-WindowChange $script:trX $script:trD $i
+    $dDLong = Get-WindowChange $script:trX $script:trD $i (4 * $config.TrendSeconds)
+    if ($null -eq $dT -or $null -eq $dD) { $st = '' } else { $st = Get-TrendState $dT $dD $dDLong }
+    $script:trend.Add([pscustomobject]@{ X = $script:trX[$i]; State = $st; dT = $dT; dD = $dD })
+}
+
+# Rebuild everything (start, settings change, history reload).
+function Update-Trend {
+    $script:trX.Clear(); $script:trT.Clear(); $script:trD.Clear(); $script:trend.Clear()
+    if ($config.TrendEnabled) {
+        $tx = $script:rawX[$config.TrendTemp]; $dx = $script:rawX[$config.TrendDriver]
+        if ($tx -and $dx) {
+            $ty = $script:rawY[$config.TrendTemp]; $dy = $script:rawY[$config.TrendDriver]
+            $byX = @{}; for ($k = 0; $k -lt $dx.Count; $k++) { $byX[$dx[$k]] = $dy[$k] }   # both come from the same row
+            for ($k = 0; $k -lt $tx.Count; $k++) {
+                if ($byX.ContainsKey($tx[$k])) { $script:trX.Add($tx[$k]); $script:trT.Add($ty[$k]); $script:trD.Add($byX[$tx[$k]]) }
+            }
+            for ($k = 0; $k -lt $script:trX.Count; $k++) { Add-TrendAt $k }
+        }
+    }
+    $chart.Invalidate()
+}
+
+# Add the newest reading only (every timer tick).
+function Add-TrendReading([double]$x, [double]$keepFrom) {
+    if (-not $config.TrendEnabled) { return }
+    $t = $config.TrendTemp; $d = $config.TrendDriver
+    if (-not $script:cur.ContainsKey($t) -or -not $script:cur.ContainsKey($d)) { return }
+    $tx = $script:rawX[$t]; $dx = $script:rawX[$d]
+    if ($tx.Count -eq 0 -or $dx.Count -eq 0 -or $tx[$tx.Count - 1] -ne $x -or $dx[$dx.Count - 1] -ne $x) { return }
+    $script:trX.Add($x); $script:trT.Add($script:cur[$t]); $script:trD.Add($script:cur[$d])
+    Add-TrendAt ($script:trX.Count - 1)
+    while ($script:trX.Count -gt 0 -and $script:trX[0] -lt $keepFrom) {
+        $script:trX.RemoveAt(0); $script:trT.RemoveAt(0); $script:trD.RemoveAt(0); $script:trend.RemoveAt(0)
+    }
+}
+
+function Get-TrendAt([double]$x) {
+    $best = $null; $bestD = [double]::MaxValue
+    foreach ($p in $script:trend) { $d = [math]::Abs($p.X - $x); if ($d -lt $bestD) { $bestD = $d; $best = $p } }
+    if ($best -and $bestD -le (Get-GapDays)) { $best } else { $null }
+}
+
+# Number of separate "rising without extra load" stretches on the graph right now.
+function Get-IndependentCount {
+    $since = $script:nowX - $config.HistoryMinutes / 1440.0
+    $n = 0; $prev = ''
+    foreach ($p in $script:trend) {
+        if ($p.X -lt $since) { continue }
+        if ($p.State -eq 'Independent' -and $prev -ne 'Independent') { $n++ }
+        $prev = $p.State
+    }
+    $n
+}
+
+# Coloured strip along the bottom of the temperature plot; neighbouring readings with the same state are
+# merged into one block, and a reading covers the time halfway to its neighbours.
+function Draw-TrendRibbon($g) {
+    if ($script:trend.Count -eq 0) { return }
+    $r = Get-PlotRect $area
+    $h = [single](Px 6); $top = $r.Bottom - $h
+    $min = $area.AxisX.Minimum; $max = $area.AxisX.Maximum
+    $half = $config.IntervalSeconds / 2 / 86400.0; $gap = Get-GapDays
+    $g.SmoothingMode = 'None'
+    $tr = $script:trend; $n = $tr.Count
+    $runState = ''; $runL = 0.0; $runR = 0.0
+    for ($i = 0; $i -le $n; $i++) {
+        if ($i -lt $n) {
+            $x = $tr[$i].X
+            $l = if ($i -gt 0 -and $x - $tr[$i - 1].X -le $gap) { ($x + $tr[$i - 1].X) / 2 } else { $x - $half }
+            $rr = if ($i -lt $n - 1 -and $tr[$i + 1].X - $x -le $gap) { ($x + $tr[$i + 1].X) / 2 } else { $x + $half }
+            $st = $tr[$i].State
+            if ($st -eq $runState -and [math]::Abs($l - $runR) -lt 1e-9) { $runR = $rr; continue }
+        }
+        if ($runState -and $runR -gt $min -and $runL -lt $max) {         # flush the finished block
+            $x1 = [single]$area.AxisX.ValueToPixelPosition([math]::Max($runL, $min))
+            $x2 = [single]$area.AxisX.ValueToPixelPosition([math]::Min($runR, $max))
+            $b = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(210, $TrendStyle[$runState].Color))
+            $g.FillRectangle($b, $x1, $top, [math]::Max([single]1, $x2 - $x1), $h); $b.Dispose()
+        }
+        if ($i -lt $n) { $runState = $st; $runL = $l; $runR = $rr }
+    }
+    $g.SmoothingMode = 'AntiAlias'
 }
 
 function Update-AxisRange([datetime]$now) {
@@ -763,7 +977,7 @@ function Update-AxisRange([datetime]$now) {
 function Import-History {
     $now  = Get-Date
     $script:nowX = $now.ToOADate()
-    $from = $now.AddMinutes(-$config.HistoryMinutes).AddSeconds(-$config.AverageSeconds)
+    $from = $now.AddMinutes(-$config.HistoryMinutes).AddSeconds(-[math]::Max($config.AverageSeconds, 4 * $config.TrendSeconds))
     $rows = @(Read-RecentThermalRows $csvPath $from)
     if ($rows.Count -eq 0) { return 0 }
     $cols = Sort-ThermalColumns @($rows | ForEach-Object { $_.Values.Keys } | Select-Object -Unique)
@@ -802,16 +1016,24 @@ function Save-Pending {
     catch { return $false }
 }
 
-$script:baseStatus = ''
+$script:baseStatus = @()       # fields from the last reading
+$script:loadedCount = 0
 function Update-StatusExtras {
-    $extra = if ($config.AverageEnabled) { "    Graph: $(Format-Step $config.AverageSeconds 's') moving average" } else { '' }
-    $status.Text = $script:baseStatus + $extra
+    if ($script:baseStatus.Count -eq 0) { return }          # no reading yet: keep the current message
+    $f = @($script:baseStatus)
+    if ($config.AverageEnabled) { $f += @{ Key = 'avg'; Label = 'Graph'; Value = "$(Format-Step $config.AverageSeconds 's') average" } }
+    if ($config.TrendEnabled) {
+        $n = Get-IndependentCount
+        $f += @{ Key = 'trend'; Label = 'Rising without load'; Value = "$n$(if ($n -eq 1) { ' time' } else { ' times' })"; Color = $(if ($n -gt 0) { $Theme.Warn } else { $null }) }
+    }
+    if ($script:loadedCount -gt 0) { $f += @{ Key = 'loaded'; Label = 'From log'; Value = "$($script:loadedCount) readings" } }
+    Set-StatusFields $f
 }
 
 function Update-Readings {
     $now   = Get-Date
     $temps = @(Read-AllTemps)
-    if ($temps.Count -eq 0) { $status.Text = "$($now.ToString('HH:mm:ss'))  -  no sensors could be read"; return }
+    if ($temps.Count -eq 0) { $script:baseStatus = @(); Set-StatusMessage "$($now.ToString('HH:mm:ss'))  -  no sensors could be read" $Theme.Warn; return }
     if (-not $script:firstAt) { $script:firstAt = $now }
     $x = $now.ToOADate(); $script:nowX = $x
 
@@ -819,7 +1041,7 @@ function Update-Readings {
     $row  = ConvertTo-ThermalRow $temps $now.ToString('yyyy-MM-dd HH:mm:ss') $metrics
     $cols = Sort-ThermalColumns @($row.Keys | Where-Object { $_ -ne 'Timestamp' })
     $since = $x - $config.HistoryMinutes / 1440.0
-    $keepFrom = $since - $config.AverageSeconds / 86400.0
+    $keepFrom = $since - [math]::Max($config.AverageSeconds, 4 * $config.TrendSeconds) / 86400.0
 
     $names = @(); $hotName = ''; $hotVal = -999; $tempCount = 0
     foreach ($col in $cols) {
@@ -844,10 +1066,17 @@ function Update-Readings {
     Refresh-List $names
     Update-AxisRange $now
 
-    $script:baseStatus = "Last read $($now.ToString('HH:mm:ss'))    $tempCount temperature sensors    Hottest: $hotName $($hotVal.ToString('0.0', $Inv)) $Deg`C"
+    Add-TrendReading $x $keepFrom
+
+    $f = @(
+        @{ Key = 'time';    Label = 'Last read'; Value = $now.ToString('HH:mm:ss') },
+        @{ Key = 'count';   Label = 'Sensors';   Value = "$tempCount" },
+        @{ Key = 'hot';     Label = 'Hottest';   Value = "$hotName $($hotVal.ToString('0.0', $Inv)) $Deg`C"; Color = (Get-TempColor $hotVal) }
+    )
     $pw = $metrics | Where-Object Sensor -eq 'CPU Power' | Select-Object -First 1
-    if ($pw) { $script:baseStatus += "    CPU $($pw.Value) W" }
-    if (-not ($cols | Where-Object { $_ -match '^GPU' })) { $script:baseStatus += "    GPU temperature not available" }
+    if ($pw) { $f += @{ Key = 'cpuw'; Label = 'CPU'; Value = "$(([double]$pw.Value).ToString('0.0', $Inv)) W" } }
+    if (-not ($cols | Where-Object { $_ -match '^GPU' })) { $f += @{ Key = 'nogpu'; Label = ''; Value = 'GPU temperature not available'; Color = $Theme.Muted } }
+    $script:baseStatus = $f
     Update-StatusExtras
 
     if ($config.LogToCsv) {
@@ -865,14 +1094,31 @@ function Show-SettingsDialog {
     $dlg.FormBorderStyle = 'FixedDialog'; $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
     $dlg.ShowInTaskbar = $false; $dlg.StartPosition = 'CenterParent'
     $dlg.Add_HandleCreated({ param($s, $e) Set-DarkTitleBar $s })
-    $W = Px 560; $pad = Px 24; $inputW = Px 96
+    $ColW = Px 520; $W = 2 * $ColW; $pad = Px 24; $inputW = Px 96; $choiceW = Px 170
 
     $script:set = @{}
-    $y = Px 18
-    $title = New-Object System.Windows.Forms.Label
-    $title.Text = 'SETTINGS'; $title.Font = $HeaderFont; $title.ForeColor = $Theme.Text; $title.AutoSize = $true
-    $title.Location = New-Object System.Drawing.Point($pad, $y); $dlg.Controls.Add($title)
-    $y += Px 30
+    $y0 = Px 18
+    foreach ($h in @(@{ T = 'SETTINGS'; X = 0 }, @{ T = 'TREND INDICATOR'; X = $ColW })) {
+        $title = New-Object System.Windows.Forms.Label
+        $title.Text = $h.T; $title.Font = $HeaderFont; $title.ForeColor = $Theme.Text; $title.AutoSize = $true
+        $title.Location = New-Object System.Drawing.Point(($h.X + $pad), $y0); $dlg.Controls.Add($title)
+    }
+    $y0 += Px 30
+
+    # temperature sensors known so far, in list order (the saved choice is kept even if not read yet)
+    $tempNames = @(@($script:unit.Keys | Where-Object { $script:unit[$_] -eq "$Deg`C" }) + $config.TrendTemp |
+        Select-Object -Unique | Sort-Object @{ e = { Get-ThermalColumnRank $_ } }, @{ e = { $_ } })
+
+    $trendRows = @(
+        @{ Key = 'TrendEnabled';     Title = 'Show trend strip';   Desc = 'Coloured strip under the temperature graph: does the temperature move with the load?'; Kind = 'bool' },
+        @{ Key = 'TrendTemp';        Title = 'Temperature';        Desc = 'The temperature to watch.'; Kind = 'choice'; Options = $tempNames },
+        @{ Key = 'TrendDriver';      Title = 'Compare with';       Desc = 'Power follows heat most closely; load % ignores clock speed.'; Kind = 'choice'; Options = @('CPU Power', 'CPU Load', 'GPU Power', 'GPU Load') },
+        @{ Key = 'TrendSeconds';     Title = 'Window (s)';         Desc = 'Each change is measured over this many seconds (10 - 600).'; Kind = 'num' },
+        @{ Key = 'TrendTempStepC';   Title = "Temperature step ($Deg`C)"; Desc = 'Smaller changes count as steady (0.1 - 10).'; Kind = 'dec' },
+        @{ Key = 'TrendPowerStepW';  Title = 'Power step (W)';     Desc = 'Smaller power changes count as steady (0.1 - 50).'; Kind = 'dec' },
+        @{ Key = 'TrendLoadStepPct'; Title = 'Load step (%)';      Desc = 'Smaller load changes count as steady (1 - 50).'; Kind = 'dec' }
+    )
+    foreach ($r in $trendRows) { $r.Col = 1 }
 
     $rows = @(
         @{ Key = 'IntervalSeconds'; Title = 'Read interval';      Desc = 'Seconds between sensor readings (1 - 3600).'; Kind = 'num' },
@@ -884,28 +1130,46 @@ function Show-SettingsDialog {
         @{ Key = 'LogToCsv';        Title = 'Log to CSV';         Desc = 'Append every reading to data\thermal_log.csv.'; Kind = 'bool' },
         @{ Key = 'AllHardware';     Title = 'Probe all hardware'; Desc = 'Also query motherboard Super I/O, RAM SPD, USB controllers and PSUs. Off is safer. Applies after restart.'; Kind = 'bool' }
     )
-    foreach ($r in $rows) {
+    foreach ($r in $rows) { $r.Col = 0 }
+    $yCol = @($y0, $y0)
+    foreach ($r in @($rows) + @($trendRows)) {
+        $x0 = $r.Col * $ColW; $y = $yCol[$r.Col]
+        $ctlW = if ($r.Kind -eq 'choice') { $choiceW } else { $inputW }
+        $cx = $x0 + $ColW - $pad - $ctlW
         $t = New-Object System.Windows.Forms.Label
         $t.Text = $r.Title; $t.Font = $UiFontBold; $t.ForeColor = $Theme.Text; $t.AutoSize = $true
-        $t.Location = New-Object System.Drawing.Point($pad, $y)
+        $t.Location = New-Object System.Drawing.Point(($x0 + $pad), $y)
         $d = New-Object System.Windows.Forms.Label
         $d.Text = $r.Desc; $d.Font = $SmallFont; $d.ForeColor = $Theme.Muted; $d.AutoSize = $false
-        $d.Size = New-Object System.Drawing.Size(($W - 2 * $pad - $inputW - (Px 20)), (Px 32))
-        $d.Location = New-Object System.Drawing.Point($pad, ($y + (Px 20)))
+        $d.Size = New-Object System.Drawing.Size(($ColW - 2 * $pad - $ctlW - (Px 20)), (Px 32))
+        $d.Location = New-Object System.Drawing.Point(($x0 + $pad), ($y + (Px 20)))
         $dlg.Controls.AddRange(@($t, $d))
-        if ($r.Kind -eq 'num') {
-            $c = New-Object System.Windows.Forms.TextBox
-            $c.Text = [string]$config[$r.Key]; $c.BackColor = $Theme.Input; $c.ForeColor = $Theme.Text
-            $c.BorderStyle = 'FixedSingle'; $c.Font = $UiFont; $c.TextAlign = 'Right'; $c.Width = $inputW
-            $c.Location = New-Object System.Drawing.Point(($W - $pad - $inputW), ($y + (Px 8)))
-        } else {
-            $c = New-CheckToggle 'Enabled' ([bool]$config[$r.Key]) $null
-            $c.Location = New-Object System.Drawing.Point(($W - $pad - $inputW), ($y + (Px 6)))
+        switch ($r.Kind) {
+            { $_ -in 'num', 'dec' } {
+                $c = New-Object System.Windows.Forms.TextBox
+                $c.Text = ([double]$config[$r.Key]).ToString('0.##', $Inv); $c.BackColor = $Theme.Input; $c.ForeColor = $Theme.Text
+                $c.BorderStyle = 'FixedSingle'; $c.Font = $UiFont; $c.TextAlign = 'Right'; $c.Width = $inputW
+                $c.Location = New-Object System.Drawing.Point($cx, ($y + (Px 8)))
+            }
+            'choice' {
+                $c = New-Object System.Windows.Forms.ComboBox
+                $c.DropDownStyle = 'DropDownList'; $c.FlatStyle = 'Flat'; $c.Font = $UiFont
+                $c.BackColor = $Theme.Input; $c.ForeColor = $Theme.Text; $c.Width = $choiceW
+                [void]$c.Items.AddRange([object[]]@($r.Options))
+                $c.SelectedItem = [string]$config[$r.Key]
+                if ($c.SelectedIndex -lt 0 -and $c.Items.Count) { $c.SelectedIndex = 0 }
+                $c.Location = New-Object System.Drawing.Point($cx, ($y + (Px 6)))
+            }
+            default {
+                $c = New-CheckToggle 'Enabled' ([bool]$config[$r.Key]) $null
+                $c.Location = New-Object System.Drawing.Point($cx, ($y + (Px 6)))
+            }
         }
         $dlg.Controls.Add($c)
         $script:set[$r.Key] = $c
-        $y += Px 60
+        $yCol[$r.Col] = $y + (Px 60)
     }
+    $y = [math]::Max($yCol[0], $yCol[1])
 
     $err = New-Object System.Windows.Forms.Label
     $err.ForeColor = $Theme.Hot; $err.AutoSize = $false; $err.Font = $SmallFont
@@ -926,24 +1190,38 @@ function Show-SettingsDialog {
         $s = $script:set
         $num = @{}
         $bad = @()
-        foreach ($k in 'IntervalSeconds', 'HistoryMinutes', 'AverageSeconds', 'WarnC', 'HotC') {
+        foreach ($k in 'IntervalSeconds', 'HistoryMinutes', 'AverageSeconds', 'WarnC', 'HotC', 'TrendSeconds') {
             $v = 0
-            if ([int]::TryParse($s[$k].Text.Trim(), [ref]$v)) { $num[$k] = $v } else { $bad += $k }
+            if ([int]::TryParse($s[$k].Text.Trim(), [ref]$v)) { $num[$k] = $v } else { $bad += "$k is not a whole number" }
+        }
+        foreach ($k in 'TrendTempStepC', 'TrendPowerStepW', 'TrendLoadStepPct') {
+            $v = 0.0
+            if ([double]::TryParse(($s[$k].Text.Trim() -replace ',', '.'), [Globalization.NumberStyles]::Float, $Inv, [ref]$v)) { $num[$k] = $v } else { $bad += "$k is not a number" }
         }
         if (-not $bad -and ($num.IntervalSeconds -lt 1 -or $num.IntervalSeconds -gt 3600)) { $bad += 'Read interval must be 1 - 3600' }
         if (-not $bad -and ($num.HistoryMinutes -lt 1 -or $num.HistoryMinutes -gt 1440)) { $bad += 'Graph history must be 1 - 1440' }
         if (-not $bad -and ($num.AverageSeconds -lt 5 -or $num.AverageSeconds -gt 3600)) { $bad += 'Average window must be 5 - 3600' }
         if (-not $bad -and ($num.WarnC -ge $num.HotC -or $num.WarnC -lt 20 -or $num.HotC -gt 120)) { $bad += 'Warm must be below Hot (20 - 120)' }
-        if ($bad) { $s['_err'].Text = 'Please fix: ' + (($bad | ForEach-Object { $_ -replace '^(IntervalSeconds|HistoryMinutes|AverageSeconds|WarnC|HotC)$', '$1 is not a whole number' }) -join '; '); return }
-        Apply-Settings $num $s.AverageEnabled.Tag.Checked $s.LogToCsv.Tag.Checked $s.AllHardware.Tag.Checked
+        if (-not $bad -and ($num.TrendSeconds -lt 10 -or $num.TrendSeconds -gt 600)) { $bad += 'Trend window must be 10 - 600' }
+        if (-not $bad -and ($num.TrendTempStepC -lt 0.1 -or $num.TrendTempStepC -gt 10)) { $bad += 'Temperature step must be 0.1 - 10' }
+        if (-not $bad -and ($num.TrendPowerStepW -lt 0.1 -or $num.TrendPowerStepW -gt 50)) { $bad += 'Power step must be 0.1 - 50' }
+        if (-not $bad -and ($num.TrendLoadStepPct -lt 1 -or $num.TrendLoadStepPct -gt 50)) { $bad += 'Load step must be 1 - 50' }
+        if ($bad) { $s['_err'].Text = 'Please fix: ' + ($bad -join '; '); return }
+        $num.AverageEnabled = $s.AverageEnabled.Tag.Checked; $num.LogToCsv = $s.LogToCsv.Tag.Checked
+        $num.AllHardware = $s.AllHardware.Tag.Checked; $num.TrendEnabled = $s.TrendEnabled.Tag.Checked
+        $num.TrendTemp = [string]$s.TrendTemp.SelectedItem; $num.TrendDriver = [string]$s.TrendDriver.SelectedItem
+        Apply-Settings $num
         $this.FindForm().DialogResult = 'OK'
     })
     [void]$dlg.ShowDialog($form)
     $dlg.Dispose()
 }
 
-function Apply-Settings($num, [bool]$avgOn, [bool]$logOn, [bool]$allHw) {
-    $historyChanged = $num.HistoryMinutes -ne $config.HistoryMinutes
+function Apply-Settings($num) {
+    $avgOn = [bool]$num.AverageEnabled; $logOn = [bool]$num.LogToCsv; $allHw = [bool]$num.AllHardware
+    # a longer history, average or trend window needs more readings from the log
+    $historyChanged = $num.HistoryMinutes -ne $config.HistoryMinutes -or
+        [math]::Max($num.AverageSeconds, 4 * $num.TrendSeconds) -gt [math]::Max($config.AverageSeconds, 4 * $config.TrendSeconds)
     $restart = $allHw -ne $config.AllHardware
     $config.IntervalSeconds = $num.IntervalSeconds
     $config.HistoryMinutes  = $num.HistoryMinutes
@@ -951,6 +1229,8 @@ function Apply-Settings($num, [bool]$avgOn, [bool]$logOn, [bool]$allHw) {
     $config.AverageEnabled  = $avgOn
     $config.WarnC = [double]$num.WarnC; $config.HotC = [double]$num.HotC
     $config.LogToCsv = $logOn; $config.AllHardware = $allHw
+    foreach ($k in 'TrendEnabled', 'TrendTemp', 'TrendDriver', 'TrendSeconds', 'TrendTempStepC', 'TrendPowerStepW', 'TrendLoadStepPct') { $config[$k] = $num[$k] }
+    Set-Toggle $tglTrend $config.TrendEnabled
     Save-ThermalConfig $AppRoot $config
 
     $timer.Interval = $config.IntervalSeconds * 1000
@@ -972,7 +1252,7 @@ $timer.Interval = $config.IntervalSeconds * 1000
 $timer.Add_Tick({
     $timer.Stop()
     try { Update-Readings }
-    catch { $status.Text = "Read error: $($_.Exception.Message)" }
+    catch { Set-StatusMessage "Read error: $($_.Exception.Message)" $Theme.Hot }
     finally { if (-not $script:paused) { $timer.Start() } }
 })
 
@@ -986,10 +1266,10 @@ $btnSensors.Add_Click({
 $tips.SetToolTip($btnSensors, $(if ($config.SensorsCollapsed) { 'Show sensor list' } else { 'Hide sensor list' }))
 $btnPause.Add_Click({
     $script:paused = -not $script:paused
-    if ($script:paused) { $timer.Stop(); $btnPause.Text = 'Resume'; $status.Text = 'Paused' }
+    if ($script:paused) { $timer.Stop(); $btnPause.Text = 'Resume'; Set-StatusMessage 'Paused' $Theme.Muted }
     else { $btnPause.Text = 'Pause'; $timer.Start() }
 })
-$btnNow.Add_Click({ try { Update-Readings } catch { $status.Text = "Read error: $($_.Exception.Message)" } })
+$btnNow.Add_Click({ try { Update-Readings } catch { Set-StatusMessage "Read error: $($_.Exception.Message)" $Theme.Hot } })
 $btnFolder.Add_Click({ Start-Process explorer.exe "`"$OutDir`"" })
 $btnSettings.Add_Click({ Show-SettingsDialog })
 
@@ -1042,9 +1322,17 @@ $chart.Add_MouseLeave({ $script:hoverX = $null; $chart.Invalidate() })
 
 $chart.Add_PostPaint({
     param($sender, $e)
-    if ($null -eq $script:hoverX -or $e.ChartElement -isnot [System.Windows.Forms.DataVisualization.Charting.ChartArea]) { return }
-    $a = $e.ChartElement
+    # Panels get their crosshair and dots; the value box is drawn in the chart's own (last) PostPaint,
+    # after the legends, so nothing paints over it.
+    $isFinal = $e.ChartElement -is [System.Windows.Forms.DataVisualization.Charting.Chart]
+    if (-not $isFinal -and $e.ChartElement -isnot [System.Windows.Forms.DataVisualization.Charting.ChartArea]) { return }
+    $a = if ($isFinal) { $area } else { $e.ChartElement }
     if (-not $a.Visible) { return }
+    if (-not $isFinal -and $a.Name -eq 'main' -and $config.TrendEnabled) {
+        try { Draw-TrendRibbon $e.ChartGraphics.Graphics }
+        catch { $script:paintError = "trend: $($_.Exception.Message) @ line $($_.InvocationInfo.ScriptLineNumber)" }
+    }
+    if ($null -eq $script:hoverX) { return }
     try {
         $shown = @($chart.Series | Where-Object { $_.Enabled -and $_.Points.Count -gt 0 })
         if ($shown.Count -eq 0) { return }
@@ -1058,24 +1346,23 @@ $chart.Add_PostPaint({
 
         $g = $e.ChartGraphics.Graphics
         $g.SmoothingMode = 'AntiAlias'; $g.TextRenderingHint = 'ClearTypeGridFit'
-        $r  = Get-PlotRect $a
-        $px = [single]$a.AxisX.ValueToPixelPosition($snap)
-
-        # crosshair + dots in this panel
-        $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(150, $Theme.Muted), [single](Px 1)); $pen.DashStyle = 'Dash'
-        $g.DrawLine($pen, $px, $r.Top, $px, $r.Bottom); $pen.Dispose()
-        $rad = [single](Px 4)
-        $ring = New-Object System.Drawing.Pen($Theme.Editor, [single](Px 1.5))
-        foreach ($en in @($entries | Where-Object Area -eq $a.Name)) {
-            $py = [single]$en.Y
-            $b = New-Object System.Drawing.SolidBrush($en.Color)
-            $g.FillEllipse($b, $px - $rad, $py - $rad, 2 * $rad, 2 * $rad); $g.DrawEllipse($ring, $px - $rad, $py - $rad, 2 * $rad, 2 * $rad)
-            $b.Dispose()
+        if (-not $isFinal) {
+            # crosshair + dots in this panel
+            $r  = Get-PlotRect $a
+            $px = [single]$a.AxisX.ValueToPixelPosition($snap)
+            $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(150, $Theme.Muted), [single](Px 1)); $pen.DashStyle = 'Dash'
+            $g.DrawLine($pen, $px, $r.Top, $px, $r.Bottom); $pen.Dispose()
+            $rad = [single](Px 4)
+            $ring = New-Object System.Drawing.Pen($Theme.Editor, [single](Px 1.5))
+            foreach ($en in @($entries | Where-Object Area -eq $a.Name)) {
+                $py = [single]$en.Y
+                $b = New-Object System.Drawing.SolidBrush($en.Color)
+                $g.FillEllipse($b, $px - $rad, $py - $rad, 2 * $rad, 2 * $rad); $g.DrawEllipse($ring, $px - $rad, $py - $rad, 2 * $rad, 2 * $rad)
+                $b.Dispose()
+            }
+            $ring.Dispose()
+            return
         }
-        $ring.Dispose()
-        # Draw the value box once, while painting the last visible panel, so no panel paints over it.
-        $lastPanel = if ($perf.Visible) { 'perf' } else { 'main' }
-        if ($a.Name -ne $lastPanel) { return }
         $a = if ($script:hoverArea -eq 'perf' -and $perf.Visible) { $perf } else { $area }
         $px = [single]$a.AxisX.ValueToPixelPosition($snap)
 
@@ -1086,12 +1373,26 @@ $chart.Add_PostPaint({
         if ($config.AverageEnabled) { $title += "   avg $(Format-Step $config.AverageSeconds 's')" }
         $lines = @(@($here) + @($other) | ForEach-Object { [pscustomobject]@{ L = $_.Name; R = (Format-Value $_.Name $_.Value -WithUnit); C = $_.Color } })
         $sepAfter = if ($here.Count -gt 0 -and $other.Count -gt 0) { $here.Count } else { -1 }
+        # trend at this moment: state in its colour, then the two changes
+        $trendLines = @()
+        if ($config.TrendEnabled) {
+            $tp = Get-TrendAt $snap
+            if ($tp -and $null -ne $tp.dT) {
+                $sec = Format-Step $config.TrendSeconds 's'
+                $stTxt = if ($tp.State) { $TrendStyle[$tp.State].Text } else { 'Steady' }
+                $stCol = if ($tp.State) { $TrendStyle[$tp.State].Color } else { $Theme.Muted }
+                $trendLines += [pscustomobject]@{ T = "Trend: $stTxt"; C = $stCol }
+                $trendLines += [pscustomobject]@{ T = ("{0} {1:+0.0;-0.0;0.0} {2}C, {3} {4:+0.0;-0.0;0.0} {5} over {6}" -f $config.TrendTemp, $tp.dT, $Deg, $config.TrendDriver, $tp.dD, (Get-TrendDriverUnit), $sec); C = $Theme.Muted }
+            }
+        }
         $lineH = [single]([System.Windows.Forms.TextRenderer]::MeasureText('Ag', $UiFont).Height + (Px 2))
         $sw = [single](Px 9); $pad = [single](Px 10); $gap = [single](Px 18)
         $wL = ($lines | ForEach-Object { [System.Windows.Forms.TextRenderer]::MeasureText($_.L, $UiFont).Width } | Measure-Object -Maximum).Maximum
         $wR = ($lines | ForEach-Object { [System.Windows.Forms.TextRenderer]::MeasureText($_.R, $UiFontBold).Width } | Measure-Object -Maximum).Maximum
-        $boxW = [single]([math]::Max($sw + (Px 8) + $wL + $gap + $wR, [System.Windows.Forms.TextRenderer]::MeasureText($title, $UiFont).Width) + 2 * $pad)
-        $boxH = [single](($lines.Count + 1) * $lineH + 2 * $pad + (Px 4) + $(if ($sepAfter -ge 0) { Px 6 } else { 0 }))
+        $wT = [int](@($trendLines | ForEach-Object { [System.Windows.Forms.TextRenderer]::MeasureText($_.T, $UiFont).Width }) + 0 | Measure-Object -Maximum).Maximum
+        $boxW = [single]([math]::Max([math]::Max($sw + (Px 8) + $wL + $gap + $wR, [System.Windows.Forms.TextRenderer]::MeasureText($title, $UiFont).Width), $wT) + 2 * $pad)
+        $trendH = if ($trendLines.Count) { $trendLines.Count * $lineH + (Px 6) } else { 0 }
+        $boxH = [single](($lines.Count + 1) * $lineH + 2 * $pad + (Px 4) + $(if ($sepAfter -ge 0) { Px 6 } else { 0 }) + $trendH)
         $r = Get-PlotRect $area; $r2 = Get-PlotRect $perf      # the box may use the whole graph height
         if ($perf.Visible) { $r = [System.Drawing.RectangleF]::Union($r, $r2) }
 
@@ -1125,20 +1426,29 @@ $chart.Add_PostPaint({
             Draw-Text $g $ln.R $UiFontBold $Theme.Text $rr 'Right'
             $yy += $lineH
         }
+        if ($trendLines.Count) {
+            $sp = New-Object System.Drawing.Pen($Theme.HoverBorder)
+            $g.DrawLine($sp, $bx + $pad, $yy + (Px 3), $bx + $boxW - $pad, $yy + (Px 3)); $sp.Dispose()
+            $yy += Px 6
+            foreach ($tl in $trendLines) {
+                Draw-Text $g $tl.T $UiFont $tl.C (New-Object System.Drawing.Rectangle([int]($bx + $pad), [int]$yy, [int]($boxW - 2 * $pad), [int]$lineH))
+                $yy += $lineH
+            }
+        }
     } catch { $script:paintError = "$($_.Exception.Message) @ line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())" }
 })
 
 # ---------------------------------------------------------------- start / stop
 $form.Add_Shown({
     $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-    $status.Text = 'Starting sensors (first run downloads and verifies LibreHardwareMonitor)...'
+    Set-StatusMessage 'Starting sensors (first run downloads and verifies LibreHardwareMonitor)...'
     $form.Refresh()
     try {
         $loaded = 0
         try { $loaded = Import-History } catch { }   # earlier readings from the log
         Initialize-ThermalCore $AppRoot $ScriptDir $config.AllHardware
         Update-Readings
-        if ($loaded -gt 0) { $script:baseStatus += "    Loaded $loaded earlier reading(s) from the log"; Update-StatusExtras }
+        if ($loaded -gt 0) { $script:loadedCount = $loaded; Update-StatusExtras }
         $timer.Start()
     } catch {
         Show-Error $_.Exception.Message
