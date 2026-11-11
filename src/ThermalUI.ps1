@@ -605,23 +605,38 @@ $perf.AlignmentStyle = 'PlotPosition'
 $perf.Visible = $false
 $chart.ChartAreas.Add($perf)
 
+# One legend per panel, placed directly under it: temperatures under the top graph,
+# power / load / clock under the bottom one.
 $legend = New-Object System.Windows.Forms.DataVisualization.Charting.Legend 'legend'
-$legend.Docking = 'Bottom'; $legend.Font = $UiFont; $legend.BackColor = $Theme.Editor; $legend.ForeColor = $Theme.Text
-$chart.Legends.Add($legend)
+$perfLegend = New-Object System.Windows.Forms.DataVisualization.Charting.Legend 'perfLegend'
+foreach ($lg in $legend, $perfLegend) {
+    $lg.Font = $UiFont; $lg.BackColor = $Theme.Editor; $lg.ForeColor = $Theme.Text
+    $lg.Position.Auto = $false
+    $chart.Legends.Add($lg)
+}
+
+function New-ChartPos($y, $h) { New-Object System.Windows.Forms.DataVisualization.Charting.ElementPosition(0, $y, 100, $h) }
 
 # Show the lower panel only when a power / load / clock line is ticked.
+# Cheap to call often: it only re-lays out the chart when the panel has to appear or disappear.
+$script:layoutPerfOn = $null
 function Update-AreaLayout {
     $perfOn = [bool]($chart.Series | Where-Object { $_.Enabled -and $_.ChartArea -eq 'perf' } | Select-Object -First 1)
+    $ghzOn  = [bool]($chart.Series | Where-Object { $_.Enabled -and $_.YAxisType -eq 'Secondary' } | Select-Object -First 1)
+    $perf.AxisY2.Enabled = if ($ghzOn) { 'True' } else { 'False' }      # right-hand GHz axis only when a clock line is shown
+    if ($perfOn -eq $script:layoutPerfOn) { return }
+    $script:layoutPerfOn = $perfOn
     $area.Position.Auto = $false; $perf.Position.Auto = $false
-    $legend.Position.Auto = $false
-    $legend.Position = New-Object System.Windows.Forms.DataVisualization.Charting.ElementPosition(0, 92, 100, 8)
     if ($perfOn) {
-        $area.Position = New-Object System.Windows.Forms.DataVisualization.Charting.ElementPosition(0, 0, 100, 60)
-        $perf.Position = New-Object System.Windows.Forms.DataVisualization.Charting.ElementPosition(0, 60, 100, 32)
-        $perf.Visible = $true
+        $area.Position       = New-ChartPos 0  56
+        $legend.Position     = New-ChartPos 56 6
+        $perf.Position       = New-ChartPos 62 31
+        $perfLegend.Position = New-ChartPos 93 7
+        $perf.Visible = $true; $perfLegend.Enabled = $true
     } else {
-        $area.Position = New-Object System.Windows.Forms.DataVisualization.Charting.ElementPosition(0, 0, 100, 92)
-        $perf.Visible = $false
+        $area.Position   = New-ChartPos 0  92
+        $legend.Position = New-ChartPos 92 8
+        $perf.Visible = $false; $perfLegend.Enabled = $false
     }
 }
 Update-AreaLayout
@@ -660,11 +675,15 @@ function Add-SensorIfNew([string]$name, [string]$unit = "$Deg`C") {
     $s.Enabled = $script:plot.Contains($name); $s.IsVisibleInLegend = $s.Enabled
     if ($unit -ne "$Deg`C") {
         $s.ChartArea = 'perf'                                   # power / load / clock panel
+        $s.Legend = 'perfLegend'
         if ($unit -eq 'GHz') { $s.YAxisType = 'Secondary' }     # clocks on the right-hand axis
         $s.LegendText = "$name ($unit)"
-    }
+    } else { $s.Legend = 'legend' }
     $s.Color = Get-LineColor $name                              # fixed colour; the hover box reuses it
     $chart.Series.Add($s)
+    # A ticked power/load line that is new this run (not in the loaded history) must open the
+    # lower panel; otherwise only its legend entry would show.
+    if ($s.Enabled) { Update-AreaLayout }
 }
 
 function Add-ChartPoint($series, [double]$x, [double]$y) {
